@@ -1,8 +1,8 @@
 use std::fs::{read_dir, Metadata};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::str;
+use std::path::{Path, PathBuf};
+use std::{env, str};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u32)]
@@ -50,10 +50,11 @@ enum ResultCode {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum Command {
     Auth,
     List,
-    // Cwd(PathBuf),
+    Cwd(PathBuf),
     Syst, //implemantation command
     NoOp,
     Pwd,
@@ -70,7 +71,7 @@ impl AsRef<str> for Command {
         match *self {
             Command::Auth => "AUTH",
             Command::List => "LIST",
-            // Command::Cwd(_) => "CWD",
+            Command::Cwd(_) => "CWD",
             Command::Syst => "SYST",
             Command::NoOp => "NOOP",
             Command::Pwd => "PWD",
@@ -97,6 +98,11 @@ impl Command {
         let command = match command.as_slice() {
             b"AUTH" => Command::Auth,
             b"SYST" => Command::Syst,
+            b"CWD" => Command::Cwd(
+                data.map(|bytes| Path::new(str::from_utf8(bytes).unwrap()).to_path_buf())
+                    .unwrap(),
+            ),
+
             b"USER" => Command::User(
                 data.map(|bytes| {
                     String::from_utf8(bytes.to_vec()).expect("cannot convert bytes to string")
@@ -170,6 +176,8 @@ impl Client {
                 ResultCode::CommandNotImplemented,
                 "Not Implemented",
             ),
+
+            Command::Cwd(cwd) => println!("{:?}", cwd),
             Command::NoOp => send_cmd(&mut self.stream, ResultCode::Ok, "Doing nothing..."),
 
             Command::Syst => send_cmd(&mut self.stream, ResultCode::Ok, "I won't tell"),
@@ -238,11 +246,11 @@ impl Client {
 
                     let mut out = String::new();
                     for entry in read_dir(tmp).unwrap() {
-                        for entry in dir {
-                            if let Ok(entry) = entry {
-                                add_file_info(entry.path(), &mut out);
-                            }
-                        }
+                        // for entry in dir {
+                        //     if let Ok(entry) = entry {
+                        //         add_file_info(entry.path(), &mut out);
+                        //     }
+                        // }
                         send_data(data_writer, &out);
                     }
                 } else {
@@ -285,36 +293,111 @@ impl Client {
             ),
         }
     }
+
+    fn complate_path(&self, path: PathBuf, server_root: &PathBuf) -> Result<PathBuf, io::Error> {
+        // Segalanya mulai menjadi lucu di sini. Seluruh proses kanonisasi ada di dalam di sana.
+        // Sekarang mari kita tambahkan jalur pengguna ke jalur server (yang sebenarnya):
+
+        // Jadi, jika path adalah path absolut (dimulai dengan "/" pada Unix atau awalan pada
+        // Windows seperti c:), kita perlu menghapus komponen pertama dari path tersebut, jika
+        // tidak, kita hanya menambahkannya.
+        let directroy = server_root.join(if path.has_root() {
+            path.iter().skip(1).collect()
+        } else {
+            path
+        });
+
+        // Kita sekarang memiliki jalur yang lengkap dan berpotensi ada. Mari kita kanonisasi:
+        let dir = directroy.canonicalize();
+
+        // Sekarang kita memiliki satu hal lagi yang perlu diperiksa-jika jalurnya tidak dimulai dengan root server,
+        // maka itu berarti pengguna mencoba menipu kita dan mencoba mengakses folder yang tidak dapat diakses.
+        // Inilah cara kita melakukannya:
+        if let Ok(ref dir) = dir {
+            if !dir.starts_with(&server_root) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+        }
+        dir
+    }
+
+    fn cwd(mut self, directory: PathBuf) {
+        let server_root = env::current_dir().unwrap();
+        //
+        // Untuk saat ini, Anda tidak dapat mengatur folder mana yang digunakan untuk menjalankan
+        // server; ini akan diubah nanti:
+        let path = self.cwd.join(&directory);
+
+        // Pertama, kita menggabungkan direktori yang diminta ke direktori pengguna saat ini:
+        if let Ok(dir) = self.complate_path(path, &server_root) {
+            if let Ok(prefix) = dir.strip_prefix(&server_root).map(|p| p.to_path_buf()) {
+                // Setelah kita mendapatkan jalur direktori lengkap dan telah mengonfirmasi bahwa semuanya baik-baik saja,
+                // kita perlu menghapus awalan server_root untuk mendapatkan jalur dari root server kita:
+                self.cwd = prefix.to_path_buf();
+                send_cmd(
+                    &mut self.stream,
+                    ResultCode::Ok,
+                    &format!("Directory change to \"{}\"", directory.display()),
+                );
+                return;
+            }
+        }
+
+        // Jika terjadi kesalahan, kami akan mengirimkan kembali yang berikut ini:
+        send_cmd(
+            &mut self.stream,
+            ResultCode::FileNotFound,
+            "No such file or directory",
+        )
+    }
 }
 
 fn send_data(stream: &mut TcpStream, s: &str) {}
 
-fn add_file_info(path: PathBuf, out: &mut str) {
-    let extra = if path.is_dir() { "/" } else { "" };
-    let is_dir = if path.is_dir() { "d" } else { "-" };
+// fn add_file_info(path: PathBuf, out: &mut str) {
+//     let extra = if path.is_dir() { "/" } else { "" };
+//     let is_dir = if path.is_dir() { "d" } else { "-" };
+//
+//     let meta = match ::std::fs::metadata(&path) {
+//         Ok(meta) => meta,
+//         _ => return,
+//     };
+//
+//     let (time, file_size) = get_file_info(&meta);
+//     let path = match path.to_str() {
+//         Some(path) => match path.split("/").last() {
+//             Some(path) => path,
+//             _ => return,
+//         },
+//         _ => return,
+//     };
+//
+//     let right = if meta.permissions().readonly() {
+//         "r--r--r--"
+//     } else {
+//         "rw-rw-rw-"
+//     };
+//
+//     let file_str = format!("{is_dir}{rights} {links} {owner} {group} {size} {month} {day} {hour}:{min} {path}{extra}\r\n",
+//         is_dir=is_dir,
+//         rights=rights,
+//         links=1,
+//         owner="anonymous",
+//         group="anonymous",
+//         size=file_size,
+//         month=MONTH[time.tm_mon as usize],
+//         day=time.tm_mday,
+//         hour=time.tm_hour,
+//         min=time.tm_min,
+//         path=path,
+//         extra=extra,
+//     );
+//
+//     println!("==> {:?}", &file_str);
+// }
+//
+// fn get_file_info(meta: &Metadata) {}
 
-    let meta = match ::std::fs::metadata(&path) {
-        Ok(meta) => meta,
-        _ => return,
-    };
-
-    let (time, file_size) = get_file_info(&meta);
-    let path = match path.to_str() {
-        Some(path) => match path.split("/").last() {
-            Some(path) => path,
-            _ => return,
-        },
-        _ => return,
-    };
-
-    let right = if meta.permissions().readonly() {
-        "r--r--r--"
-    } else {
-        "rw-rw-rw-"
-    };
-}
-
-fn get_file_info(meta: &Metadata) {}
 // Sekarang saatnya memperbarui fungsi handle_client:
 fn handle_client(mut stream: TcpStream) {
     println!("new client connected!!");
